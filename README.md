@@ -30,7 +30,7 @@ Please also check this documentation:
 | Componente               | Cantidad |
 |--------------------------|----------|
 | Wemos Lolin ESP32 (OLED integrado) | 1 |
-| Sensor DHT22             | 2        |
+| Sensor DHT21 (AM2301)    | 2        |
 | Módulo relé 2 canales (activo LOW) | 1 |
 | Extractor de aire        | 1        |
 | Deshumidificador Peltier | 1        |
@@ -41,10 +41,11 @@ Please also check this documentation:
 |---------------------|-----------|------------------------------|
 | OLED SDA            | GPIO 5    | Integrado en la placa        |
 | OLED SCL            | GPIO 4    | Integrado en la placa        |
-| DHT22 interior DATA | GPIO 13   | Pull-up 10 kΩ a 3.3 V       |
-| DHT22 exterior DATA | GPIO 14   | Pull-up 10 kΩ a 3.3 V       |
+| DHT21 (AM2301) interior DATA | GPIO 13   | Pull-up 10 kΩ a 3.3 V       |
+| DHT21 (AM2301) exterior DATA | GPIO 14   | Pull-up 10 kΩ a 3.3 V       |
 | Relé extractor IN   | GPIO 26   | Activo LOW                   |
-| Relé deshumid. IN   | GPIO 27   | Activo LOW                   |
+| Relé deshumid. IN   | GPIO 25   | Activo LOW                   |
+| Botón pantalla      | GPIO 12   | Pull-up interno; GND al pulsar |
 
 ### Diagrama de bloques
 
@@ -52,9 +53,11 @@ Please also check this documentation:
                         ┌─────────────────────────────────┐
                         │      Wemos Lolin ESP32           │
                         │                                  │
-   DHT22 (interior) ────┤ GPIO13          GPIO26 ├──── Relé CH1 ──► Extractor
+   DHT21 (AM2301) (interior) ────┤ GPIO13          GPIO26 ├──── Relé CH1 ──► Extractor
                         │                                  │
-   DHT22 (exterior) ────┤ GPIO14          GPIO27 ├──── Relé CH2 ──► Deshumidificador
+   DHT21 (AM2301) (exterior) ────┤ GPIO14          GPIO25 ├──── Relé CH2 ──► Deshumidificador
+                        │                                  │
+              Botón ────┤ GPIO12                           │
                         │                                  │
                         │   GPIO4/5 (I2C)                  │
                         │      │                           │
@@ -62,12 +65,12 @@ Please also check this documentation:
                         └─────────────────────────────────┘
 ```
 
-### Cableado de los sensores DHT22
+### Cableado de los sensores DHT21 (AM2301)
 
-Cada DHT22 se conecta del mismo modo:
+Cada DHT21 (AM2301) se conecta del mismo modo:
 
 ```
-DHT22
+DHT21 (AM2301)
  ┌───┐
  │ 1 ├──── VCC (3.3 V)
  │   │         │
@@ -79,6 +82,19 @@ DHT22
  └───┘
 ```
 
+### Cableado del botón de pantalla
+
+El botón activa la pantalla OLED durante 30 segundos. Usa el pull-up interno del ESP32,
+por lo que no necesita resistencia externa.
+
+```
+ESP32          Botón
+GPIO12 ────── [  ]
+GND    ────── [  ]
+```
+
+Al pulsar, GPIO12 cae a GND (flanco descendente). En reposo permanece en HIGH gracias al pull-up interno.
+
 ### Cableado del módulo de relé (2 canales)
 
 ```
@@ -87,7 +103,7 @@ Módulo relé          ESP32
 │ VCC      ├──── 5 V  (o 3.3 V según módulo)
 │ GND      ├──── GND
 │ IN1      ├──── GPIO26  (extractor)
-│ IN2      ├──── GPIO27  (deshumidificador)
+│ IN2      ├──── GPIO25  (deshumidificador)
 │          │
 │ COM1/NO1 ├──── Fase ──► Extractor
 │ COM2/NO2 ├──── Fase ──► Deshumidificador
@@ -175,7 +191,7 @@ actuador está teniendo efecto antes de entrar en el intervalo largo.
 El firmware usa **FreeRTOS** con tres tareas concurrentes:
 
 ```
-Core 1  taskSensors  prio 3  Lee DHT22 con intervalos adaptativos
+Core 1  taskSensors  prio 3  Lee DHT21 (AM2301) con intervalos adaptativos
 Core 1  taskControl  prio 2  Evalúa estado y activa/desactiva relés
 Core 0  taskDisplay  prio 1  Refresca la pantalla OLED cada 500 ms
 ```

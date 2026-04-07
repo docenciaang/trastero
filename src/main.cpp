@@ -4,7 +4,7 @@
 //
 // Arquitectura de tareas FreeRTOS
 // --------------------------------
-//  Core 1 | taskSensors  prio 3  Lee DHT22 cada 2 s y actualiza datos compartidos
+//  Core 1 | taskSensors  prio 3  Lee DHT21 cada 2 s y actualiza datos compartidos
 //  Core 1 | taskControl  prio 2  Evalua estado y activa/desactiva reles
 //  Core 0 | taskDisplay  prio 1  Refresca la pantalla OLED cada 500 ms
 //
@@ -28,9 +28,10 @@
 #define PIN_DHT_INTERIOR    13
 #define PIN_DHT_EXTERIOR    14
 #define PIN_RELAY_EXTRACTOR 26
-#define PIN_RELAY_DEHUMID   27
+#define PIN_RELAY_DEHUMID   25
+#define PIN_BUTTON          12   // boton externo: GPIO12 — GND al pulsar (pull-up interno activo)
 
-// =============================================================================
+// ============================================================================
 // Display I2C
 // =============================================================================
 #define I2C_SDA   5
@@ -38,29 +39,47 @@
 #define OLED_ADDR 0x3C
 
 // =============================================================================
+// Modo pruebas
+// =============================================================================
+// Con PRUEBAS 1 los intervalos se reducen para verificar la logica rapidamente
+// sin esperar los tiempos de produccion.
+// Cambiar a 0 antes de flashear el firmware definitivo.
+// =============================================================================
+#define PRUEBAS 1
+
+// =============================================================================
 // Temporización
 // =============================================================================
 //
 // Intervalos de lectura de sensores (adaptativos por estado):
 //
-//   IDLE          10 min  Humedad OK y estable; solo vigila que no supere 70%
-//   EXTRACTOR_ON   2 min  Dispositivo activo; detectar bajada a 65%
-//   DEHUMID_ON     5 min  Peltier es mas lento; menos frecuencia suficiente
-//   SAFE_OFF       30 s   Recuperacion rapida de fallo de sensor
-//   CONFIRMACION   30 s   Lectura extra inmediata tras cualquier cambio de estado
+//   IDLE          10 min  /  20 s  Humedad OK y estable; solo vigila que no supere 70%
+//   EXTRACTOR_ON   2 min  /  10 s  Dispositivo activo; detectar bajada a 65%
+//   DEHUMID_ON     5 min  /  15 s  Peltier es mas lento; menos frecuencia suficiente
+//   SAFE_OFF       30 s   /   5 s  Recuperacion rapida de fallo de sensor
+//   CONFIRMACION   30 s   /   5 s  Lectura extra inmediata tras cualquier cambio de estado
 //
 // Cuando taskControl cambia de estado, notifica a taskSensors via
 // xTaskNotify para que se despierte antes de que expire su intervalo largo
-// y haga la lectura de confirmacion a los 30 s.
+// y haga la lectura de confirmacion.
 //
-#define INTERVAL_IDLE_MS          (10UL * 60 * 1000)   // 10 min
-#define INTERVAL_EXTRACTOR_MS      (2UL * 60 * 1000)   //  2 min
-#define INTERVAL_DEHUMID_MS        (5UL * 60 * 1000)   //  5 min
-#define INTERVAL_SAFE_OFF_MS              (30 * 1000)   // 30 s
-#define INTERVAL_CONFIRMATION_MS          (30 * 1000)   // 30 s tras cambio de estado
+#if PRUEBAS
+  #define INTERVAL_IDLE_MS              (20 * 1000)   // 20 s
+  #define INTERVAL_EXTRACTOR_MS         (10 * 1000)   // 10 s
+  #define INTERVAL_DEHUMID_MS           (15 * 1000)   // 15 s
+  #define INTERVAL_SAFE_OFF_MS           (5 * 1000)   //  5 s
+  #define INTERVAL_CONFIRMATION_MS       (5 * 1000)   //  5 s tras cambio de estado
+#else
+  #define INTERVAL_IDLE_MS          (10UL * 60 * 1000)   // 10 min
+  #define INTERVAL_EXTRACTOR_MS      (2UL * 60 * 1000)   //  2 min
+  #define INTERVAL_DEHUMID_MS        (5UL * 60 * 1000)   //  5 min
+  #define INTERVAL_SAFE_OFF_MS              (30 * 1000)   // 30 s
+  #define INTERVAL_CONFIRMATION_MS          (30 * 1000)   // 30 s tras cambio de estado
+#endif
 
 #define CONTROL_INTERVAL_MS      500
 #define DISPLAY_INTERVAL_MS      500
+#define DISPLAY_TIMEOUT_MS   (30 * 1000)   // 30 s encendido al inicio y al pulsar boton
 
 // =============================================================================
 // Umbrales de control (% RH)
@@ -114,13 +133,25 @@ TaskHandle_t hTaskSensors = nullptr;
 TaskHandle_t hTaskControl = nullptr;
 TaskHandle_t hTaskDisplay = nullptr;
 
+// Marca de tiempo hasta la que la pantalla debe permanecer encendida.
+// Escrita desde ISR y leida desde taskDisplay; volatile es suficiente
+// porque en ESP32 los accesos a uint32 alineados son atomicos.
+volatile unsigned long displayOffAt = 0;
+
 // =============================================================================
 // Objetos hardware (cada uno solo se usa desde una tarea, sin mutex propio)
 // =============================================================================
 
 SSD1306Wire display(OLED_ADDR, I2C_SDA, I2C_SCL);  // solo taskDisplay
-DHT dhtInterior(PIN_DHT_INTERIOR, DHT22);           // solo taskSensors
-DHT dhtExterior(PIN_DHT_EXTERIOR, DHT22);           // solo taskSensors
+DHT dhtInterior(PIN_DHT_INTERIOR, DHT21);           // solo taskSensors
+DHT dhtExterior(PIN_DHT_EXTERIOR, DHT21);           // solo taskSensors
+
+// =============================================================================
+// ISR boton — rearma el temporizador de pantalla
+// =============================================================================
+void IRAM_ATTR isrButton() {
+    displayOffAt = millis() + DISPLAY_TIMEOUT_MS;
+}
 
 // =============================================================================
 // Helpers (sin estado global, seguros para llamar desde cualquier tarea)
@@ -361,18 +392,35 @@ void taskControl(void*) {
 // para no bloquear las tareas criticas durante el I2C del display.
 // =============================================================================
 void taskDisplay(void*) {
-    for (;;) {
-        SensorData   intSnap, extSnap;
-        ControlState stateSnap;
+    bool screenOn = true;
 
-        if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-            intSnap   = interior;
-            extSnap   = exterior;
-            stateSnap = currentState;
-            xSemaphoreGive(dataMutex);
+    for (;;) {
+        bool shouldBeOn = (millis() < displayOffAt);
+
+        if (shouldBeOn != screenOn) {
+            screenOn = shouldBeOn;
+            if (!screenOn) {
+                display.clear();
+                display.display();
+                display.displayOff();
+            } else {
+                display.displayOn();
+            }
         }
 
-        renderDisplay(intSnap, extSnap, stateSnap);
+        if (screenOn) {
+            SensorData   intSnap, extSnap;
+            ControlState stateSnap;
+
+            if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+                intSnap   = interior;
+                extSnap   = exterior;
+                stateSnap = currentState;
+                xSemaphoreGive(dataMutex);
+            }
+
+            renderDisplay(intSnap, extSnap, stateSnap);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_INTERVAL_MS));
     }
@@ -404,6 +452,10 @@ void setup() {
     display.drawString(64, 25, "Trastero v1.0");
     display.display();
 
+    // Boton de pantalla
+    pinMode(PIN_BUTTON, INPUT_PULLUP);
+    attachInterrupt(PIN_BUTTON, isrButton, FALLING);
+
     // Sensores
     dhtInterior.begin();
     dhtExterior.begin();
@@ -411,6 +463,9 @@ void setup() {
     delay(1500);
     display.clear();
     display.display();
+
+    // Pantalla encendida 30 s desde el arranque
+    displayOffAt = millis() + DISPLAY_TIMEOUT_MS;
 
     // Mutex de datos compartidos
     dataMutex = xSemaphoreCreateMutex();
