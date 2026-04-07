@@ -1,7 +1,16 @@
+# Control de humedad en el trastero.
+
+  Se trata de controlar la humedad en un recinto pequeño ( unos 7 m2) utilizando un extractor y un pequeño deshumidificados de unos pocos litros.
+   Se utilizan dos sensores DHT21 y dos relés para control del extactor y deshumidificador. Como microcontrolador se usa un clone Semos Esp32 con pantalla OLED. 
+
+
+
+Como base para la creación de un proyecto en PlatformIo, se utiliza el siguiente repositorio :
+
 Bootstrap program for Wemos Lolin ESP32 OLED board (and clones)
 --
 
-This program allows you a quick start with the Wemos Lolin ESP32 OLED, which features a 0.96" display. Documentation online about the pinout is sketchy and, in some cases, wrong. 
+This program allows you a quick start with the Wemos Lolin ESP32 OLEun cD, which features a 0.96" display. Documentation online about the pinout is sketchy and, in some cases, wrong. 
 
 The important thing is that to communicate with the display, you need to use I2C, talking to the SSD1306 controller. The I2C address and I2C pins are:
 
