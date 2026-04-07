@@ -197,21 +197,94 @@ actuador está teniendo efecto antes de entrar en el intervalo largo.
 
 ## Arquitectura software
 
-El firmware usa **FreeRTOS** con tres tareas concurrentes:
+El firmware usa **FreeRTOS** con cuatro tareas concurrentes:
 
 ```
 Core 1  taskSensors  prio 3  Lee DHT21 (AM2301) con intervalos adaptativos
 Core 1  taskControl  prio 2  Evalúa estado y activa/desactiva relés
 Core 0  taskDisplay  prio 1  Refresca la pantalla OLED cada 500 ms
+Core 0  taskBLE      prio 2  Servidor GATT BLE, notifica cada 1 s
 ```
 
-Los datos compartidos (`interior`, `exterior`, `currentState`) están
-protegidos por un mutex. Cuando `taskControl` cambia el estado, notifica
-a `taskSensors` para que se despierte antes de que expire su intervalo
-largo y realice la lectura de confirmación.
+Los datos compartidos (`interior`, `exterior`, `currentState`, `manualOverride`,
+umbrales) están protegidos por un mutex. `taskBLE` accede a ellos con un timeout
+de 100 ms para no bloquear las tareas críticas.
 
-Para añadir WiFi o Bluetooth en el futuro basta con crear una tarea
-adicional en Core 0 que lea los datos compartidos tomando el mismo mutex.
+---
+
+## Interfaz BLE GATT
+
+El ESP32 anuncia el nombre **"Trastero"** y expone el servicio:
+
+```
+Servicio: 1b5ab4f0-0000-1000-8000-00805f9b34fb
+```
+
+### Tabla de characteristics
+
+| Nombre | UUID | Propiedades | Tamaño | Descripción |
+|---|---|---|---|---|
+| `SENSOR_INT` | `...0001` | READ, NOTIFY | 9 bytes | Temperatura y humedad interior |
+| `SENSOR_EXT` | `...0002` | READ, NOTIFY | 9 bytes | Temperatura y humedad exterior |
+| `ESTADO` | `...0003` | READ, NOTIFY | 1 byte | Estado de la máquina de control |
+| `CMD_ACTUADOR` | `...0010` | WRITE | 2 bytes | Comando de override manual |
+| `UMBRALES` | `...0011` | READ, WRITE | 12 bytes | Umbrales de humedad |
+| `HORA` | `...0012` | READ, WRITE | 4 bytes | Reloj del sistema (unix timestamp) |
+
+> UUID completo: reemplazar `...` por `1b5ab4f0-0000-1000-8000-0000000`
+
+### Formatos de payload (little-endian, IEEE 754 para floats)
+
+**SENSOR_INT / SENSOR_EXT** — 9 bytes
+```
+[0..3]  float   temperatura en °C
+[4..7]  float   humedad relativa en % RH
+[8]     uint8   1 = lectura válida, 0 = inválida
+```
+
+**ESTADO** — 1 byte
+```
+0 = IDLE           (humedad OK, actuadores apagados)
+1 = EXTRACTOR_ON   (extractor en marcha)
+2 = DEHUMID_ON     (deshumidificador Peltier en marcha)
+3 = SAFE_OFF       (fallo de sensor, todo apagado)
+```
+
+**CMD_ACTUADOR** — 2 bytes (solo escritura)
+```
+[0]  uint8  0 = AUTO            (control automático por sensores)
+            1 = FORZAR_EXTRACTOR
+            2 = FORZAR_DEHUMID
+            3 = FORZAR_OFF
+[1]  uint8  reservado (0x00)
+```
+
+**UMBRALES** — 12 bytes
+```
+[0..3]   float  humedad de activación   (defecto: 70.0 %)
+[4..7]   float  humedad de desactivación (defecto: 65.0 %)
+[8..11]  float  delta mínimo para elegir extractor (defecto: 10.0 %)
+```
+> Restricción: activación > desactivación y delta > 0; si no, se rechaza.
+
+**HORA** — 4 bytes
+```
+[0..3]  uint32  segundos desde epoch UTC (unix timestamp)
+```
+
+### Notificaciones
+
+Las characteristics `SENSOR_INT`, `SENSOR_EXT` y `ESTADO` envían notificaciones
+automáticas cada **1 segundo** cuando hay un cliente conectado con el descriptor
+CCCD activo (0x0001).
+
+### Verificación con nRF Connect
+
+1. Escanear y conectar a **"Trastero"**.
+2. Expandir el servicio `1b5ab4f0-...`.
+3. Activar notificaciones en `SENSOR_INT` / `SENSOR_EXT` / `ESTADO`.
+4. Escribir `[01 00]` en `CMD_ACTUADOR` → extractor forzado.
+5. Escribir `[00 00]` en `CMD_ACTUADOR` → volver a modo automático.
 
 ---
 

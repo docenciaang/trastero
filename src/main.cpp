@@ -21,6 +21,7 @@
 #include <DHT.h>
 #include <Wire.h>
 #include "SSD1306Wire.h"
+#include "ble_gatt.h"
 
 // =============================================================================
 // Pines
@@ -100,26 +101,9 @@
 #define RELAY_OFF HIGH
 
 // =============================================================================
-// Estructuras y tipos
-// =============================================================================
-
-struct SensorData {
-    float temperature;
-    float humidity;
-    bool  valid;
-    int   consecutiveFailures;
-};
-
-enum class ControlState {
-    IDLE,
-    EXTRACTOR_ON,
-    DEHUMID_ON,
-    SAFE_OFF
-};
-
-// =============================================================================
 // Datos compartidos entre tareas
 // Protegidos por dataMutex: leer o escribir siempre bajo el mutex.
+// Los tipos SensorData, ControlState y ManualOverride se definen en ble_gatt.h
 // =============================================================================
 
 SemaphoreHandle_t dataMutex;
@@ -127,6 +111,12 @@ SemaphoreHandle_t dataMutex;
 SensorData    interior     = {0.0f, 0.0f, false, 0};
 SensorData    exterior     = {0.0f, 0.0f, false, 0};
 ControlState  currentState = ControlState::IDLE;
+ManualOverride manualOverride = ManualOverride::NONE;
+
+// Umbrales de humedad (valores iniciales en los #define; modificables por BLE)
+float humActivate   = HUMIDITY_ACTIVATE_THRESHOLD;
+float humDeactivate = HUMIDITY_DEACTIVATE_THRESHOLD;
+float humDelta      = HUMIDITY_DELTA_EXTRACTOR;
 
 // Handles de tareas (utiles para notificaciones o suspension futura)
 TaskHandle_t hTaskSensors = nullptr;
@@ -220,17 +210,26 @@ static bool isSafetyLockout() {
 }
 
 static ControlState computeNextState(ControlState current) {
-    if (isSafetyLockout())  return ControlState::SAFE_OFF;
-    if (!interior.valid)    return current;
+    if (isSafetyLockout()) return ControlState::SAFE_OFF;
 
-    if (interior.humidity > HUMIDITY_ACTIVATE_THRESHOLD) {
+    // Override manual desde BLE tiene prioridad sobre la logica automatica
+    switch (manualOverride) {
+        case ManualOverride::FORCE_EXTRACTOR: return ControlState::EXTRACTOR_ON;
+        case ManualOverride::FORCE_DEHUMID:   return ControlState::DEHUMID_ON;
+        case ManualOverride::FORCE_OFF:        return ControlState::IDLE;
+        default: break;
+    }
+
+    if (!interior.valid) return current;
+
+    if (interior.humidity > humActivate) {
         float delta = interior.humidity - exterior.humidity;
-        return (exterior.valid && delta >= HUMIDITY_DELTA_EXTRACTOR)
+        return (exterior.valid && delta >= humDelta)
                ? ControlState::EXTRACTOR_ON
                : ControlState::DEHUMID_ON;
     }
 
-    if (interior.humidity <= HUMIDITY_DEACTIVATE_THRESHOLD) return ControlState::IDLE;
+    if (interior.humidity <= humDeactivate) return ControlState::IDLE;
 
     return current;  // banda de histeresis: mantener estado
 }
@@ -434,9 +433,8 @@ void setup() {
     Serial.begin(115200);
     Serial.println("\n[TRASTERO] Iniciando...");
 
-    // Radio apagada (reactivar cuando se añada WiFi/BT)
+    // WiFi apagado; BLE se inicializa mas adelante
     WiFi.mode(WIFI_OFF);
-    btStop();
 
     // Reles apagados antes de cualquier otra inicializacion
     pinMode(PIN_RELAY_EXTRACTOR, OUTPUT);
@@ -470,10 +468,14 @@ void setup() {
     // Mutex de datos compartidos
     dataMutex = xSemaphoreCreateMutex();
 
+    // Inicializar BLE
+    bleInit();
+
     // Crear tareas
     xTaskCreatePinnedToCore(taskSensors, "Sensors", 4096, nullptr, 3, &hTaskSensors, 1);
     xTaskCreatePinnedToCore(taskControl, "Control", 2048, nullptr, 2, &hTaskControl, 1);
     xTaskCreatePinnedToCore(taskDisplay, "Display", 4096, nullptr, 1, &hTaskDisplay, 0);
+    xTaskCreatePinnedToCore(taskBLE,     "BLE",     8192, nullptr, 2, nullptr,        0);
 
     Serial.println("[TRASTERO] Tareas iniciadas.");
 }
