@@ -13,6 +13,8 @@
 // =============================================================================
 
 #include "ble_gatt.h"
+#include "event_log.h"
+#include "ble_log.h"
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -24,13 +26,14 @@
 // UUIDs del servicio y las characteristics
 // =============================================================================
 
-#define TRASTERO_SVC_UUID    "1b5ab4f0-0000-1000-8000-00805f9b34fb"
+#define TRASTERO_SVC_UUID    "1b5ab4f0-0000-1000-8000-000000000000"
 #define CHAR_SENSOR_INT_UUID "1b5ab4f0-0000-1000-8000-000000000001"
 #define CHAR_SENSOR_EXT_UUID "1b5ab4f0-0000-1000-8000-000000000002"
 #define CHAR_ESTADO_UUID     "1b5ab4f0-0000-1000-8000-000000000003"
 #define CHAR_CMD_UUID        "1b5ab4f0-0000-1000-8000-000000000010"
 #define CHAR_UMBRALES_UUID   "1b5ab4f0-0000-1000-8000-000000000011"
 #define CHAR_HORA_UUID       "1b5ab4f0-0000-1000-8000-000000000012"
+#define CHAR_DISPLAY_UUID    "1b5ab4f0-0000-1000-8000-000000000013"
 
 // =============================================================================
 // Datos compartidos con main.cpp
@@ -44,6 +47,7 @@ extern ManualOverride    manualOverride;
 extern float             humActivate;
 extern float             humDeactivate;
 extern float             humDelta;
+extern volatile unsigned long displayOffAt;
 
 // =============================================================================
 // Estado interno del modulo BLE
@@ -56,6 +60,7 @@ static BLECharacteristic* charEstado    = nullptr;
 static BLECharacteristic* charCmd       = nullptr;
 static BLECharacteristic* charUmbrales  = nullptr;
 static BLECharacteristic* charHora      = nullptr;
+static BLECharacteristic* charDisplay   = nullptr;
 static bool               bleConnected  = false;
 
 // =============================================================================
@@ -85,6 +90,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     }
     void onDisconnect(BLEServer*) override {
         bleConnected = false;
+        eventLogResetStream();
         Serial.println("[BLE] Cliente desconectado — reiniciando advertising");
         BLEDevice::startAdvertising();
     }
@@ -173,6 +179,26 @@ class HoraCallback : public BLECharacteristicCallbacks {
 };
 
 // =============================================================================
+// Callback CMD_DISPLAY (solo WRITE)
+// Byte [0]: 0x01 = encender pantalla 30 s, 0x00 = apagar inmediatamente
+// =============================================================================
+
+class DisplayCallback : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* c) override {
+        Serial.println("[BLE] CMD_DISPLAY recibido");
+        if (c->getLength() < 1) return;
+        uint8_t cmd = c->getData()[0];
+        if (cmd == 0x01) {
+            displayOffAt = millis() + 30000UL;
+            Serial.println("[BLE] CMD_DISPLAY: pantalla encendida 30 s");
+        } else if (cmd == 0x00) {
+            displayOffAt = 0;
+            Serial.println("[BLE] CMD_DISPLAY: pantalla apagada");
+        }
+    }
+};
+
+// =============================================================================
 // bleInit — inicializar el servidor GATT y arrancar advertising
 // =============================================================================
 
@@ -181,7 +207,11 @@ void bleInit() {
     bleServer = BLEDevice::createServer();
     bleServer->setCallbacks(new ServerCallbacks());
 
-    BLEService* svc = bleServer->createService(TRASTERO_SVC_UUID);
+   // BLEService* svc = bleServer->createService(TRASTERO_SVC_UUID);
+
+    // Handles: 1 servicio + 7 características × 2 + 3 descriptores BLE2902 = 18 mínimo
+    // La librería puede reservar handles adicionales internamente; usar margen amplio
+    BLEService* svc = bleServer->createService(BLEUUID(TRASTERO_SVC_UUID), 30);
 
     charSensorInt = svc->createCharacteristic(
         CHAR_SENSOR_INT_UUID,
@@ -197,6 +227,12 @@ void bleInit() {
         CHAR_ESTADO_UUID,
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
     charEstado->addDescriptor(new BLE2902());
+    {
+        // Descriptor 0x2901 (Characteristic User Description): descripción del servicio
+        BLEDescriptor* desc = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
+        desc->setValue("Monitorizacion y control");
+        charEstado->addDescriptor(desc);
+    }
 
     charCmd = svc->createCharacteristic(
         CHAR_CMD_UUID,
@@ -213,7 +249,15 @@ void bleInit() {
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
     charHora->setCallbacks(new HoraCallback());
 
+    charDisplay = svc->createCharacteristic(
+        CHAR_DISPLAY_UUID,
+        BLECharacteristic::PROPERTY_WRITE);
+    charDisplay->setCallbacks(new DisplayCallback());
+
     svc->start();
+
+    // Inicializar el servicio BLE de log de eventos
+    bleLogServiceInit(bleServer);
 
     BLEAdvertising* adv = BLEDevice::getAdvertising();
     adv->addServiceUUID(TRASTERO_SVC_UUID);
@@ -222,6 +266,8 @@ void bleInit() {
 
     Serial.println("[BLE] Servidor iniciado");
 }
+
+bool bleIsConnected() { return bleConnected; }
 
 // =============================================================================
 // taskBLE (Core 0, prio 2)

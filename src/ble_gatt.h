@@ -14,6 +14,7 @@
 //   CMD_ACTUADOR     ...0010      WRITE           2 B: [0]=cmd [1]=reservado
 //   UMBRALES         ...0011      READ, WRITE    12 B: float activar + float desactivar + float delta
 //   HORA             ...0012      READ, WRITE     4 B: uint32 unix timestamp UTC
+//   CMD_DISPLAY      ...0013      WRITE           1 B: 0x01=encender pantalla 30 s, 0x00=apagar
 //
 // Formato CMD_ACTUADOR byte [0]:
 //   0 = AUTO (control automatico)
@@ -29,6 +30,7 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <BLEServer.h>
 
 // =============================================================================
 // Tipos compartidos (definidos aqui, usados en main.cpp y ble_gatt.cpp)
@@ -66,3 +68,6 @@ void bleInit();
 // Tarea FreeRTOS: envia notificaciones BLE cada 1 s.
 // Crear con xTaskCreatePinnedToCore en Core 0.
 void taskBLE(void* param);
+
+// Devuelve true si hay un cliente BLE conectado actualmente.
+bool bleIsConnected();

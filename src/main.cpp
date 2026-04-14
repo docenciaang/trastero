@@ -22,6 +22,7 @@
 #include <Wire.h>
 #include "SSD1306Wire.h"
 #include "ble_gatt.h"
+#include "event_log.h"
 
 // =============================================================================
 // Pines
@@ -261,6 +262,20 @@ static void applyState(ControlState state) {
 //   ──────────────────────────────────  y=26
 //   EXTR:ON   DEHU:OFF                  y=30
 //   ESTADO: EXTRACTOR                   y=44
+//                                [BT]   y=56  (icono 8x8, esquina inferior derecha x=120)
+
+// Icono Bluetooth 8x8 px en formato XBM (bit0 = columna izquierda).
+// Representa el logotipo BT: barra vertical + dos horquillas diagonales.
+static const uint8_t BT_ICON_8x8[] PROGMEM = {
+    0x08,  // . . . X . . . .
+    0x18,  // . . . X X . . .
+    0x24,  // . . X . . X . .
+    0x18,  // . . . X X . . .
+    0x18,  // . . . X X . . .
+    0x24,  // . . X . . X . .
+    0x18,  // . . . X X . . .
+    0x08,  // . . . X . . . .
+};
 
 static const int COL_LABEL  =   0;
 static const int COL_TEMP_R =  70;
@@ -291,7 +306,7 @@ static void drawSensorRow(int y, const char* label, const SensorData& data) {
 // =============================================================================
 
 static void renderDisplay(const SensorData& intSnap, const SensorData& extSnap,
-                           ControlState stateSnap) {
+                           ControlState stateSnap, bool bleOn) {
     bool extrOn = (stateSnap == ControlState::EXTRACTOR_ON);
     bool dehuOn = (stateSnap == ControlState::DEHUMID_ON);
 
@@ -309,6 +324,10 @@ static void renderDisplay(const SensorData& intSnap, const SensorData& extSnap,
         "  DEHU:" + (dehuOn ? "ON " : "OFF"));
 
     display.drawString(0, 44, String("ESTADO: ") + stateLabel(stateSnap));
+
+    if (bleOn) {
+        display.drawXbm(120, 56, 8, 8, BT_ICON_8x8);
+    }
 
     display.display();
 }
@@ -360,16 +379,32 @@ void taskSensors(void*) {
 void taskControl(void*) {
     for (;;) {
         ControlState next;
-
+        ControlState prev;
         bool stateChanged = false;
+        LogEntry logEntry = {};
 
         if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+            prev = currentState;
             next = computeNextState(currentState);
             if (next != currentState) {
                 Serial.printf("[CONTROL] %s -> %s\n",
                               stateLabel(currentState), stateLabel(next));
+                // Capturar snapshot para el log mientras se tiene el mutex
+                logEntry.timestamp = (uint32_t)time(nullptr);
+                logEntry.prevState = prev;
+                logEntry.newState  = next;
+                logEntry.intSnap   = interior;
+                logEntry.extSnap   = exterior;
                 currentState = next;
                 stateChanged = true;
+/**
+                Serial.printf("[DEBUG] Registro logEntry creado: timestamp=%u, prevState=%s, newState=%s, intValid=%u, extValid=%u\n",
+                              logEntry.timestamp,
+                              stateLabel(logEntry.prevState),
+                              stateLabel(logEntry.newState),
+                              logEntry.intSnap.valid ? 1 : 0,
+                              logEntry.extSnap.valid ? 1 : 0);
+                              */
             }
             xSemaphoreGive(dataMutex);
         }
@@ -379,6 +414,11 @@ void taskControl(void*) {
         // Despertar taskSensors para lectura de confirmacion a los 30 s
         if (stateChanged && hTaskSensors != nullptr) {
             xTaskNotify(hTaskSensors, 0, eNoAction);
+        }
+
+        // Encolar el evento de log FUERA del mutex, no bloquea
+        if (stateChanged) {
+            eventLogEnqueue(logEntry);
         }
 
         vTaskDelay(pdMS_TO_TICKS(CONTROL_INTERVAL_MS));
@@ -418,7 +458,7 @@ void taskDisplay(void*) {
                 xSemaphoreGive(dataMutex);
             }
 
-            renderDisplay(intSnap, extSnap, stateSnap);
+            renderDisplay(intSnap, extSnap, stateSnap, bleIsConnected());
         }
 
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_INTERVAL_MS));
@@ -468,14 +508,18 @@ void setup() {
     // Mutex de datos compartidos
     dataMutex = xSemaphoreCreateMutex();
 
+    // Inicializar sistema de log de eventos en flash
+    eventLogInit();
+
     // Inicializar BLE
     bleInit();
 
     // Crear tareas
-    xTaskCreatePinnedToCore(taskSensors, "Sensors", 4096, nullptr, 3, &hTaskSensors, 1);
-    xTaskCreatePinnedToCore(taskControl, "Control", 2048, nullptr, 2, &hTaskControl, 1);
-    xTaskCreatePinnedToCore(taskDisplay, "Display", 4096, nullptr, 1, &hTaskDisplay, 0);
-    xTaskCreatePinnedToCore(taskBLE,     "BLE",     8192, nullptr, 2, nullptr,        0);
+    xTaskCreatePinnedToCore(taskSensors,  "Sensors",  4096, nullptr, 3, &hTaskSensors, 1);
+    xTaskCreatePinnedToCore(taskControl,  "Control",  2048, nullptr, 2, &hTaskControl, 1);
+    xTaskCreatePinnedToCore(taskDisplay,  "Display",  4096, nullptr, 1, &hTaskDisplay, 0);
+    xTaskCreatePinnedToCore(taskBLE,      "BLE",      8192, nullptr, 2, nullptr,        0);
+    xTaskCreatePinnedToCore(taskEventLog, "EventLog", 4096, nullptr, 1, nullptr,        0);
 
     Serial.println("[TRASTERO] Tareas iniciadas.");
 }

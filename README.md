@@ -230,6 +230,7 @@ Servicio: 1b5ab4f0-0000-1000-8000-00805f9b34fb
 | `CMD_ACTUADOR` | `...0010` | WRITE | 2 bytes | Comando de override manual |
 | `UMBRALES` | `...0011` | READ, WRITE | 12 bytes | Umbrales de humedad |
 | `HORA` | `...0012` | READ, WRITE | 4 bytes | Reloj del sistema (unix timestamp) |
+| `CMD_DISPLAY` | `...0013` | WRITE | 1 byte | Enciende o apaga la pantalla OLED |
 
 > UUID completo: reemplazar `...` por `1b5ab4f0-0000-1000-8000-0000000`
 
@@ -270,6 +271,12 @@ Servicio: 1b5ab4f0-0000-1000-8000-00805f9b34fb
 **HORA** — 4 bytes
 ```
 [0..3]  uint32  segundos desde epoch UTC (unix timestamp)
+```
+
+**CMD_DISPLAY** — 1 byte (solo escritura)
+```
+0x01 = encender pantalla 30 s
+0x00 = apagar pantalla
 ```
 
 ### Notificaciones
