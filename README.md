@@ -197,44 +197,42 @@ actuador está teniendo efecto antes de entrar en el intervalo largo.
 
 ## Arquitectura software
 
-El firmware usa **FreeRTOS** con cuatro tareas concurrentes:
+El firmware usa **FreeRTOS** con cinco tareas concurrentes:
 
 ```
-Core 1  taskSensors  prio 3  Lee DHT21 (AM2301) con intervalos adaptativos
-Core 1  taskControl  prio 2  Evalúa estado y activa/desactiva relés
-Core 0  taskDisplay  prio 1  Refresca la pantalla OLED cada 500 ms
-Core 0  taskBLE      prio 2  Servidor GATT BLE, notifica cada 1 s
+Core 1  taskSensors   prio 3  Lee DHT21 (AM2301) con intervalos adaptativos
+Core 1  taskControl   prio 2  Evalúa estado y activa/desactiva relés
+Core 0  taskDisplay   prio 1  Refresca la pantalla OLED cada 500 ms
+Core 0  taskBLE       prio 2  Servidor GATT BLE, notifica cada 1 s
+Core 0  taskEventLog  prio 1  Drena la cola de eventos y los guarda en NVS; gestiona streaming CSV
 ```
 
 Los datos compartidos (`interior`, `exterior`, `currentState`, `manualOverride`,
-umbrales) están protegidos por un mutex. `taskBLE` accede a ellos con un timeout
-de 100 ms para no bloquear las tareas críticas.
+umbrales, intervalos) están protegidos por un mutex. `taskBLE` accede a ellos con
+un timeout de 100 ms para no bloquear las tareas críticas.
 
 ---
 
 ## Interfaz BLE GATT
 
-El ESP32 anuncia el nombre **"Trastero"** y expone el servicio:
+El ESP32 anuncia el nombre **"Trastero"** y expone tres servicios GATT.
 
-```
-Servicio: 1b5ab4f0-0000-1000-8000-00805f9b34fb
-```
+> Todos los UUID tienen la forma `1b5ab4f0-SSSS-1000-8000-000000000000` donde `SSSS` identifica el servicio y los últimos cuatro dígitos identifican la characteristic. Todos los valores multi-byte son little-endian (IEEE 754 para floats).
 
-### Tabla de characteristics
+---
 
-| Nombre | UUID | Propiedades | Tamaño | Descripción |
+### Servicio principal — `...0000-...`
+
+UUID: `1b5ab4f0-0000-1000-8000-000000000000`
+
+| Nombre | UUID (sufijo) | Propiedades | Tamaño | Descripción |
 |---|---|---|---|---|
 | `SENSOR_INT` | `...0001` | READ, NOTIFY | 9 bytes | Temperatura y humedad interior |
 | `SENSOR_EXT` | `...0002` | READ, NOTIFY | 9 bytes | Temperatura y humedad exterior |
 | `ESTADO` | `...0003` | READ, NOTIFY | 1 byte | Estado de la máquina de control |
 | `CMD_ACTUADOR` | `...0010` | WRITE | 2 bytes | Comando de override manual |
-| `UMBRALES` | `...0011` | READ, WRITE | 12 bytes | Umbrales de humedad |
 | `HORA` | `...0012` | READ, WRITE | 4 bytes | Reloj del sistema (unix timestamp) |
 | `CMD_DISPLAY` | `...0013` | WRITE | 1 byte | Enciende o apaga la pantalla OLED |
-
-> UUID completo: reemplazar `...` por `1b5ab4f0-0000-1000-8000-0000000`
-
-### Formatos de payload (little-endian, IEEE 754 para floats)
 
 **SENSOR_INT / SENSOR_EXT** — 9 bytes
 ```
@@ -260,14 +258,6 @@ Servicio: 1b5ab4f0-0000-1000-8000-00805f9b34fb
 [1]  uint8  reservado (0x00)
 ```
 
-**UMBRALES** — 12 bytes
-```
-[0..3]   float  humedad de activación   (defecto: 70.0 %)
-[4..7]   float  humedad de desactivación (defecto: 65.0 %)
-[8..11]  float  delta mínimo para elegir extractor (defecto: 10.0 %)
-```
-> Restricción: activación > desactivación y delta > 0; si no, se rechaza.
-
 **HORA** — 4 bytes
 ```
 [0..3]  uint32  segundos desde epoch UTC (unix timestamp)
@@ -279,19 +269,78 @@ Servicio: 1b5ab4f0-0000-1000-8000-00805f9b34fb
 0x00 = apagar pantalla
 ```
 
-### Notificaciones
-
 Las characteristics `SENSOR_INT`, `SENSOR_EXT` y `ESTADO` envían notificaciones
 automáticas cada **1 segundo** cuando hay un cliente conectado con el descriptor
 CCCD activo (0x0001).
 
+---
+
+### Servicio de log — `...0001-...`
+
+UUID: `1b5ab4f0-0001-1000-8000-000000000000`
+
+Permite descargar el histórico de transiciones de estado almacenado en NVS (hasta 100 registros, buffer circular).
+
+| Nombre | UUID (sufijo) | Propiedades | Tamaño | Descripción |
+|---|---|---|---|---|
+| `LOG_COUNT` | `...0001` | READ | 4 bytes | Número de registros almacenados (uint32 LE) |
+| `LOG_CTRL`  | `...0002` | WRITE | 1 byte | `0x01` = iniciar descarga CSV; `0x02` = borrar log |
+| `LOG_DATA`  | `...0003` | NOTIFY | variable | Chunks de texto CSV hasta `---EOF---\r\n` |
+
+**Formato CSV descargado** (separador `;`, compatible con Excel europeo):
+```
+sep=;
+Fecha;Hora;Estado_Anterior;Estado_Nuevo;Temp_Int;Hum_Int;Val_Int;Temp_Ext;Hum_Ext;Val_Ext
+2025-07-01;14:32:05;IDLE;EXTRACTOR;24.3;71.2;1;19.8;55.0;1
+2025-07-01;15:10:22;EXTRACTOR;IDLE;24.1;64.8;1;19.9;56.1;1
+---EOF---
+```
+
+Si el reloj no se ha configurado con `HORA`, la fecha aparece como `1970-01-01;00:00:00`. Los campos de sensores inválidos se muestran como `--`.
+
+---
+
+### Servicio de configuración — `...0002-...`
+
+UUID: `1b5ab4f0-0002-1000-8000-000000000000`
+
+Permite leer y modificar en tiempo real los umbrales de humedad y los intervalos de muestreo. Los cambios son inmediatos pero no persisten tras un reinicio.
+
+| Nombre | UUID (sufijo) | Propiedades | Tamaño | Descripción |
+|---|---|---|---|---|
+| `UMBRALES`   | `...0001` | READ, WRITE | 12 bytes | Umbrales de humedad |
+| `INTERVALOS` | `...0002` | READ, WRITE | 20 bytes | Intervalos de muestreo por estado |
+
+**UMBRALES** — 12 bytes
+```
+[0..3]   float  humedad de activación    (defecto: 70.0 %)
+[4..7]   float  humedad de desactivación (defecto: 65.0 %)
+[8..11]  float  delta mínimo para elegir extractor (defecto: 10.0 %)
+```
+> Restricción: activación > desactivación y delta > 0; si no, se rechaza.
+
+**INTERVALOS** — 20 bytes (5 × uint32 LE, en segundos)
+```
+[0..3]   uint32  intervalo IDLE          (defecto: 600 s)
+[4..7]   uint32  intervalo EXTRACTOR_ON  (defecto: 120 s)
+[8..11]  uint32  intervalo DEHUMID_ON    (defecto: 300 s)
+[12..15] uint32  intervalo SAFE_OFF      (defecto: 30 s, mínimo: 5 s)
+[16..19] uint32  intervalo confirmación  (defecto: 30 s)
+```
+> Todos los valores deben ser > 0 y `SAFE_OFF` ≥ 5; si no, se rechazan.
+
+---
+
 ### Verificación con nRF Connect
 
 1. Escanear y conectar a **"Trastero"**.
-2. Expandir el servicio `1b5ab4f0-...`.
+2. Expandir el servicio `1b5ab4f0-0000-...`.
 3. Activar notificaciones en `SENSOR_INT` / `SENSOR_EXT` / `ESTADO`.
 4. Escribir `[01 00]` en `CMD_ACTUADOR` → extractor forzado.
 5. Escribir `[00 00]` en `CMD_ACTUADOR` → volver a modo automático.
+6. Expandir el servicio `1b5ab4f0-0001-...`.
+7. Leer `LOG_COUNT` → número de transiciones registradas.
+8. Escribir `[01]` en `LOG_CTRL`, suscribirse a `LOG_DATA` → recibir CSV completo.
 
 ---
 

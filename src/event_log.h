@@ -75,7 +75,7 @@ extern QueueHandle_t eventLogQueue;
 // API pública
 // =============================================================================
 
-// Monta LittleFS, abre/formatea /log.bin y crea la cola.
+// Abre el namespace NVS, inicializa la cabecera si es necesario y crea la cola.
 // Llamar desde setup() antes de bleInit() y de crear tareas.
 void eventLogInit();
 

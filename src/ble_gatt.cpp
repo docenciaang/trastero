@@ -15,6 +15,7 @@
 #include "ble_gatt.h"
 #include "event_log.h"
 #include "ble_log.h"
+#include "ble_config.h"
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -31,7 +32,6 @@
 #define CHAR_SENSOR_EXT_UUID "1b5ab4f0-0000-1000-8000-000000000002"
 #define CHAR_ESTADO_UUID     "1b5ab4f0-0000-1000-8000-000000000003"
 #define CHAR_CMD_UUID        "1b5ab4f0-0000-1000-8000-000000000010"
-#define CHAR_UMBRALES_UUID   "1b5ab4f0-0000-1000-8000-000000000011"
 #define CHAR_HORA_UUID       "1b5ab4f0-0000-1000-8000-000000000012"
 #define CHAR_DISPLAY_UUID    "1b5ab4f0-0000-1000-8000-000000000013"
 
@@ -44,9 +44,6 @@ extern SensorData        interior;
 extern SensorData        exterior;
 extern ControlState      currentState;
 extern ManualOverride    manualOverride;
-extern float             humActivate;
-extern float             humDeactivate;
-extern float             humDelta;
 extern volatile unsigned long displayOffAt;
 
 // =============================================================================
@@ -58,7 +55,6 @@ static BLECharacteristic* charSensorInt = nullptr;
 static BLECharacteristic* charSensorExt = nullptr;
 static BLECharacteristic* charEstado    = nullptr;
 static BLECharacteristic* charCmd       = nullptr;
-static BLECharacteristic* charUmbrales  = nullptr;
 static BLECharacteristic* charHora      = nullptr;
 static BLECharacteristic* charDisplay   = nullptr;
 static bool               bleConnected  = false;
@@ -115,49 +111,6 @@ class CmdCallback : public BLECharacteristicCallbacks {
 };
 
 // =============================================================================
-// Callback UMBRALES (READ + WRITE)
-// Payload: float activar [0..3] + float desactivar [4..7] + float delta [8..11]
-// =============================================================================
-
-struct __attribute__((packed)) UmbralesPayload {
-    float activar;
-    float desactivar;
-    float delta;
-};
-
-class UmbralesCallback : public BLECharacteristicCallbacks {
-    void onRead(BLECharacteristic* c) override {
-        UmbralesPayload buf;
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            buf.activar    = humActivate;
-            buf.desactivar = humDeactivate;
-            buf.delta      = humDelta;
-            xSemaphoreGive(dataMutex);
-        }
-        c->setValue((uint8_t*)&buf, sizeof(buf));
-    }
-
-    void onWrite(BLECharacteristic* c) override {
-        if (c->getLength() < sizeof(UmbralesPayload)) return;
-        UmbralesPayload buf;
-        memcpy(&buf, c->getData(), sizeof(buf));
-        // Sanidad minima: activar > desactivar y delta positivo
-        if (buf.activar <= buf.desactivar || buf.delta <= 0.0f) {
-            Serial.println("[BLE] UMBRALES rechazados (valores invalidos)");
-            return;
-        }
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            humActivate   = buf.activar;
-            humDeactivate = buf.desactivar;
-            humDelta      = buf.delta;
-            xSemaphoreGive(dataMutex);
-        }
-        Serial.printf("[BLE] UMBRALES: activar=%.1f desactivar=%.1f delta=%.1f\n",
-                      buf.activar, buf.desactivar, buf.delta);
-    }
-};
-
-// =============================================================================
 // Callback HORA (READ + WRITE)
 // Payload: uint32 unix timestamp UTC (segundos desde epoch)
 // =============================================================================
@@ -207,11 +160,8 @@ void bleInit() {
     bleServer = BLEDevice::createServer();
     bleServer->setCallbacks(new ServerCallbacks());
 
-   // BLEService* svc = bleServer->createService(TRASTERO_SVC_UUID);
-
-    // Handles: 1 servicio + 7 características × 2 + 3 descriptores BLE2902 = 18 mínimo
-    // La librería puede reservar handles adicionales internamente; usar margen amplio
-    BLEService* svc = bleServer->createService(BLEUUID(TRASTERO_SVC_UUID), 30);
+    // Handles: 1 servicio + 6 características × 2 + 4 descriptores = 16 mínimo; 25 con margen
+    BLEService* svc = bleServer->createService(BLEUUID(TRASTERO_SVC_UUID), 25);
 
     charSensorInt = svc->createCharacteristic(
         CHAR_SENSOR_INT_UUID,
@@ -228,7 +178,6 @@ void bleInit() {
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
     charEstado->addDescriptor(new BLE2902());
     {
-        // Descriptor 0x2901 (Characteristic User Description): descripción del servicio
         BLEDescriptor* desc = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
         desc->setValue("Monitorizacion y control");
         charEstado->addDescriptor(desc);
@@ -238,11 +187,6 @@ void bleInit() {
         CHAR_CMD_UUID,
         BLECharacteristic::PROPERTY_WRITE);
     charCmd->setCallbacks(new CmdCallback());
-
-    charUmbrales = svc->createCharacteristic(
-        CHAR_UMBRALES_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-    charUmbrales->setCallbacks(new UmbralesCallback());
 
     charHora = svc->createCharacteristic(
         CHAR_HORA_UUID,
@@ -256,8 +200,9 @@ void bleInit() {
 
     svc->start();
 
-    // Inicializar el servicio BLE de log de eventos
+    // Servicios auxiliares
     bleLogServiceInit(bleServer);
+    bleConfigServiceInit(bleServer);
 
     BLEAdvertising* adv = BLEDevice::getAdvertising();
     adv->addServiceUUID(TRASTERO_SVC_UUID);

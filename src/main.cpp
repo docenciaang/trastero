@@ -4,13 +4,11 @@
 //
 // Arquitectura de tareas FreeRTOS
 // --------------------------------
-//  Core 1 | taskSensors  prio 3  Lee DHT21 cada 2 s y actualiza datos compartidos
-//  Core 1 | taskControl  prio 2  Evalua estado y activa/desactiva reles
-//  Core 0 | taskDisplay  prio 1  Refresca la pantalla OLED cada 500 ms
-//
-//  Para añadir WiFi o BT en el futuro:
-//    xTaskCreatePinnedToCore(taskComms, "Comms", 8192, nullptr, 2, nullptr, 0);
-//  La tarea de comunicacion puede leer los datos compartidos tomando dataMutex.
+//  Core 1 | taskSensors   prio 3  Lee DHT21 con intervalos adaptativos
+//  Core 1 | taskControl   prio 2  Evalua estado y activa/desactiva reles
+//  Core 0 | taskDisplay   prio 1  Refresca la pantalla OLED cada 500 ms
+//  Core 0 | taskBLE       prio 2  Servidor GATT BLE, notifica cada 1 s
+//  Core 0 | taskEventLog  prio 1  Drena cola de eventos, escribe en NVS, streaming CSV
 // =============================================================================
 
 #include <Arduino.h>
@@ -23,6 +21,7 @@
 #include "SSD1306Wire.h"
 #include "ble_gatt.h"
 #include "event_log.h"
+#include "ble_config.h"
 
 // =============================================================================
 // Pines
@@ -40,14 +39,7 @@
 #define I2C_SCL   4
 #define OLED_ADDR 0x3C
 
-// =============================================================================
-// Modo pruebas
-// =============================================================================
-// Con PRUEBAS 1 los intervalos se reducen para verificar la logica rapidamente
-// sin esperar los tiempos de produccion.
-// Cambiar a 0 antes de flashear el firmware definitivo.
-// =============================================================================
-#define PRUEBAS 1
+
 
 // =============================================================================
 // Temporización
@@ -65,19 +57,13 @@
 // xTaskNotify para que se despierte antes de que expire su intervalo largo
 // y haga la lectura de confirmacion.
 //
-#if PRUEBAS
-  #define INTERVAL_IDLE_MS              (20 * 1000)   // 20 s
-  #define INTERVAL_EXTRACTOR_MS         (10 * 1000)   // 10 s
-  #define INTERVAL_DEHUMID_MS           (15 * 1000)   // 15 s
-  #define INTERVAL_SAFE_OFF_MS           (5 * 1000)   //  5 s
-  #define INTERVAL_CONFIRMATION_MS       (5 * 1000)   //  5 s tras cambio de estado
-#else
+
   #define INTERVAL_IDLE_MS          (10UL * 60 * 1000)   // 10 min
   #define INTERVAL_EXTRACTOR_MS      (2UL * 60 * 1000)   //  2 min
   #define INTERVAL_DEHUMID_MS        (5UL * 60 * 1000)   //  5 min
   #define INTERVAL_SAFE_OFF_MS              (30 * 1000)   // 30 s
   #define INTERVAL_CONFIRMATION_MS          (30 * 1000)   // 30 s tras cambio de estado
-#endif
+
 
 #define CONTROL_INTERVAL_MS      500
 #define DISPLAY_INTERVAL_MS      500
@@ -118,6 +104,13 @@ ManualOverride manualOverride = ManualOverride::NONE;
 float humActivate   = HUMIDITY_ACTIVATE_THRESHOLD;
 float humDeactivate = HUMIDITY_DEACTIVATE_THRESHOLD;
 float humDelta      = HUMIDITY_DELTA_EXTRACTOR;
+
+// Intervalos de sensor en ms (valores iniciales en los #define; modificables por BLE)
+uint32_t intervalIdleMs         = INTERVAL_IDLE_MS;
+uint32_t intervalExtractorMs    = INTERVAL_EXTRACTOR_MS;
+uint32_t intervalDehumidMs      = INTERVAL_DEHUMID_MS;
+uint32_t intervalSafeOffMs      = INTERVAL_SAFE_OFF_MS;
+uint32_t intervalConfirmationMs = INTERVAL_CONFIRMATION_MS;
 
 // Handles de tareas (utiles para notificaciones o suspension futura)
 TaskHandle_t hTaskSensors = nullptr;
@@ -172,10 +165,10 @@ const char* stateLabel(ControlState state) {
 // Devuelve el intervalo de espera entre lecturas segun el estado actual.
 static unsigned long sensorIntervalForState(ControlState state) {
     switch (state) {
-        case ControlState::EXTRACTOR_ON: return INTERVAL_EXTRACTOR_MS;
-        case ControlState::DEHUMID_ON:   return INTERVAL_DEHUMID_MS;
-        case ControlState::SAFE_OFF:     return INTERVAL_SAFE_OFF_MS;
-        default:                         return INTERVAL_IDLE_MS;
+        case ControlState::EXTRACTOR_ON: return intervalExtractorMs;
+        case ControlState::DEHUMID_ON:   return intervalDehumidMs;
+        case ControlState::SAFE_OFF:     return intervalSafeOffMs;
+        default:                         return intervalIdleMs;
     }
 }
 
@@ -366,7 +359,7 @@ void taskSensors(void*) {
         BaseType_t notified = xTaskNotifyWait(0, 0, &notifVal,
                                   pdMS_TO_TICKS(sensorIntervalForState(snap)));
         if (notified == pdTRUE) {
-            vTaskDelay(pdMS_TO_TICKS(INTERVAL_CONFIRMATION_MS));
+            vTaskDelay(pdMS_TO_TICKS(intervalConfirmationMs));
         }
     }
 }
@@ -507,6 +500,9 @@ void setup() {
 
     // Mutex de datos compartidos
     dataMutex = xSemaphoreCreateMutex();
+
+    // Cargar configuracion persistida (umbrales e intervalos) desde NVS
+    bleConfigLoad();
 
     // Inicializar sistema de log de eventos en flash
     eventLogInit();
