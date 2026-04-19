@@ -304,12 +304,13 @@ Si el reloj no se ha configurado con `HORA`, la fecha aparece como `1970-01-01;0
 
 UUID: `1b5ab4f0-0002-1000-8000-000000000000`
 
-Permite leer y modificar en tiempo real los umbrales de humedad y los intervalos de muestreo. Los cambios son inmediatos pero no persisten tras un reinicio.
+Permite leer y modificar en tiempo real los umbrales de humedad, los intervalos de muestreo y la planificación horaria del extractor. Los cambios se persisten en NVS y sobreviven reinicios.
 
 | Nombre | UUID (sufijo) | Propiedades | Tamaño | Descripción |
 |---|---|---|---|---|
 | `UMBRALES`   | `...0001` | READ, WRITE | 12 bytes | Umbrales de humedad |
 | `INTERVALOS` | `...0002` | READ, WRITE | 20 bytes | Intervalos de muestreo por estado |
+| `SCHEDULE`   | `...0003` | READ, WRITE | 18 bytes | Planificación horaria del extractor |
 
 **UMBRALES** — 12 bytes
 ```
@@ -322,12 +323,31 @@ Permite leer y modificar en tiempo real los umbrales de humedad y los intervalos
 **INTERVALOS** — 20 bytes (5 × uint32 LE, en segundos)
 ```
 [0..3]   uint32  intervalo IDLE          (defecto: 600 s)
-[4..7]   uint32  intervalo EXTRACTOR_ON  (defecto: 120 s)
-[8..11]  uint32  intervalo DEHUMID_ON    (defecto: 300 s)
-[12..15] uint32  intervalo SAFE_OFF      (defecto: 30 s, mínimo: 5 s)
-[16..19] uint32  intervalo confirmación  (defecto: 30 s)
+[4..7]   uint32  intervalo EXTRACTOR_ON  (defecto: 120 s) (tiempo entre lecturas de los sensores cuanto el extractor esdta en marcha)
+[8..11]  uint32  intervalo DEHUMID_ON    (defecto: 300 s) (mismo con deshumidificador)
+[12..15] uint32  intervalo SAFE_OFF      (defecto: 30 s, mínimo: 5 s) (Intervalo de lectura cuando el sistema está en estado de fallo (SAFE_OFF), es decir, cuando algún sensor lleva 5 lecturas consecutivas fallidas)
+[16..19] uint32  intervalo confirmación  (defecto: 30 s) (Tras cualquier cambio de estado (por ejemplo IDLE → EXTRACTOR_ON), taskControl despierta a taskSensors inmediatamente vía xTaskNotify. En lugar de leer al instante, taskSensors espera este intervalo de confirmación (30 s por defecto) antes de hacer la lectura.
+
+El objetivo es darle tiempo al actuador a que tenga efecto real en la humedad antes de volver a evaluar el estado. Sin esta espera, la lectura inmediata post-cambio podría encontrar la humedad aún fuera del rango y provocar una transición innecesaria.)
 ```
 > Todos los valores deben ser > 0 y `SAFE_OFF` ≥ 5; si no, se rechazan.
+
+**SCHEDULE** — 18 bytes
+```
+[0]      uint8   enabled: 0 = planificación deshabilitada, 1 = habilitada
+[1]      uint8   count: número de periodos activos (0–4)
+[2..5]   4×uint8 periodo 0: startHour, startMin, endHour, endMin
+[6..9]   4×uint8 periodo 1
+[10..13] 4×uint8 periodo 2
+[14..17] 4×uint8 periodo 3
+```
+Comportamiento:
+- Deshabilitada (`enabled=0`) o sin periodos (`count=0`): el extractor puede funcionar en cualquier momento.
+- Habilitada con periodos: el extractor solo puede activarse dentro de algún periodo. Fuera de ellos, el deshumidificador actúa como alternativa si la humedad lo requiere.
+- `FORCE_EXTRACTOR` vía `CMD_ACTUADOR` ignora la planificación.
+- Si el reloj no está configurado (el ESP32 pierde la hora en cada arranque), no se aplica ninguna restricción horaria. Esto es intencionado: tras un corte de luz el sistema sigue controlando la humedad aunque nadie haya sincronizado el reloj todavía.
+- Se admiten periodos nocturnos (cruzan medianoche): `endHour:endMin < startHour:startMin`.
+> Los periodos con índice ≥ `count` se ignoran aunque contengan datos. Las horas deben estar en UTC.
 
 ---
 

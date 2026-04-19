@@ -18,6 +18,7 @@
 #include <freertos/semphr.h>
 #include <DHT.h>
 #include <Wire.h>
+#include <esp_system.h>
 #include "SSD1306Wire.h"
 #include "ble_gatt.h"
 #include "event_log.h"
@@ -112,6 +113,12 @@ uint32_t intervalDehumidMs      = INTERVAL_DEHUMID_MS;
 uint32_t intervalSafeOffMs      = INTERVAL_SAFE_OFF_MS;
 uint32_t intervalConfirmationMs = INTERVAL_CONFIRMATION_MS;
 
+// Planificacion diaria del extractor (modificable por BLE, persistida en NVS)
+Schedule schedule = { 0, 0, {} };  // deshabilitada por defecto
+
+// Motivo del reset detectado al arranque (leido antes de cualquier otra inicializacion)
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+
 // Handles de tareas (utiles para notificaciones o suspension futura)
 TaskHandle_t hTaskSensors = nullptr;
 TaskHandle_t hTaskControl = nullptr;
@@ -203,10 +210,34 @@ static bool isSafetyLockout() {
             exterior.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES);
 }
 
+// Comprueba si la planificacion horaria permite al extractor funcionar ahora.
+// Llamar bajo dataMutex. Devuelve true si no hay restriccion.
+static bool isExtractorAllowed() {
+    if (!schedule.enabled || schedule.count == 0) return true;
+
+    time_t now = time(nullptr);
+    if ((uint32_t)now < 1577836800UL) return true;  // reloj sin configurar
+
+    struct tm t;
+    localtime_r(&now, &t);
+    int cur = t.tm_hour * 60 + t.tm_min;
+
+    for (uint8_t i = 0; i < schedule.count && i < 4; i++) {
+        int s = schedule.periods[i].startHour * 60 + schedule.periods[i].startMin;
+        int e = schedule.periods[i].endHour   * 60 + schedule.periods[i].endMin;
+        if (e > s) {                           // mismo dia
+            if (cur >= s && cur < e) return true;
+        } else {                               // periodo nocturno (cruza medianoche)
+            if (cur >= s || cur < e) return true;
+        }
+    }
+    return false;
+}
+
 static ControlState computeNextState(ControlState current) {
     if (isSafetyLockout()) return ControlState::SAFE_OFF;
 
-    // Override manual desde BLE tiene prioridad sobre la logica automatica
+    // Override manual desde BLE tiene prioridad sobre la logica automatica y la planificacion
     switch (manualOverride) {
         case ManualOverride::FORCE_EXTRACTOR: return ControlState::EXTRACTOR_ON;
         case ManualOverride::FORCE_DEHUMID:   return ControlState::DEHUMID_ON;
@@ -218,14 +249,24 @@ static ControlState computeNextState(ControlState current) {
 
     if (interior.humidity > humActivate) {
         float delta = interior.humidity - exterior.humidity;
-        return (exterior.valid && delta >= humDelta)
-               ? ControlState::EXTRACTOR_ON
-               : ControlState::DEHUMID_ON;
+        bool canExtractor = exterior.valid && delta >= humDelta && isExtractorAllowed();
+        return canExtractor ? ControlState::EXTRACTOR_ON : ControlState::DEHUMID_ON;
     }
 
     if (interior.humidity <= humDeactivate) return ControlState::IDLE;
 
-    return current;  // banda de histeresis: mantener estado
+    // Banda de histeresis: mantener estado salvo cambios de planificacion
+    // EXTRACTOR_ON -> DEHUMID_ON si el periodo ya no permite el extractor
+    if (current == ControlState::EXTRACTOR_ON && !isExtractorAllowed()) {
+        return ControlState::DEHUMID_ON;
+    }
+    // DEHUMID_ON -> EXTRACTOR_ON si empieza un periodo que permite el extractor
+    // y las condiciones exteriores lo favorecen
+    if (current == ControlState::DEHUMID_ON && isExtractorAllowed() &&
+        exterior.valid && (interior.humidity - exterior.humidity) >= humDelta) {
+        return ControlState::EXTRACTOR_ON;
+    }
+    return current;
 }
 
 static void applyState(ControlState state) {
@@ -464,6 +505,7 @@ void taskDisplay(void*) {
 
 void setup() {
     Serial.begin(115200);
+    bootResetReason = esp_reset_reason();   // leer antes de cualquier otra inicializacion
     Serial.println("\n[TRASTERO] Iniciando...");
 
     // WiFi apagado; BLE se inicializa mas adelante
@@ -501,8 +543,11 @@ void setup() {
     // Mutex de datos compartidos
     dataMutex = xSemaphoreCreateMutex();
 
-    // Cargar configuracion persistida (umbrales e intervalos) desde NVS
+    // Cargar configuracion persistida (umbrales, intervalos, schedule) desde NVS
     bleConfigLoad();
+
+    // Registrar motivo de reset en NVS y mostrarlo por Serial
+    resetInfoInit();
 
     // Inicializar sistema de log de eventos en flash
     eventLogInit();

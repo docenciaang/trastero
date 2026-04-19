@@ -50,14 +50,16 @@ extern volatile unsigned long displayOffAt;
 // Estado interno del modulo BLE
 // =============================================================================
 
-static BLEServer*         bleServer     = nullptr;
-static BLECharacteristic* charSensorInt = nullptr;
-static BLECharacteristic* charSensorExt = nullptr;
-static BLECharacteristic* charEstado    = nullptr;
-static BLECharacteristic* charCmd       = nullptr;
-static BLECharacteristic* charHora      = nullptr;
-static BLECharacteristic* charDisplay   = nullptr;
-static bool               bleConnected  = false;
+static BLEServer*         bleServer      = nullptr;
+static BLECharacteristic* charSensorInt  = nullptr;
+static BLECharacteristic* charSensorExt  = nullptr;
+static BLECharacteristic* charEstado     = nullptr;
+static BLECharacteristic* charCmd        = nullptr;
+static BLECharacteristic* charHora       = nullptr;
+static BLECharacteristic* charDisplay    = nullptr;
+static bool               bleConnected    = false;
+static uint8_t            horaSyncTick    = 0;   // contador de ciclos entre notificaciones (0..4)
+static uint8_t            horaSyncCount   = 0;   // total de notificaciones enviadas (max 10)
 
 // =============================================================================
 // Payload de sensor (9 bytes, packed, little-endian)
@@ -81,7 +83,9 @@ static void fillSensorPayload(SensorPayload& p, const SensorData& d) {
 
 class ServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer*) override {
-        bleConnected = true;
+        bleConnected  = true;
+        horaSyncTick  = 0;
+        horaSyncCount = 0;
         Serial.println("[BLE] Cliente conectado");
     }
     void onDisconnect(BLEServer*) override {
@@ -190,7 +194,10 @@ void bleInit() {
 
     charHora = svc->createCharacteristic(
         CHAR_HORA_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+        BLECharacteristic::PROPERTY_READ  |
+        BLECharacteristic::PROPERTY_WRITE |
+        BLECharacteristic::PROPERTY_NOTIFY);
+    charHora->addDescriptor(new BLE2902());
     charHora->setCallbacks(new HoraCallback());
 
     charDisplay = svc->createCharacteristic(
@@ -244,6 +251,21 @@ void taskBLE(void*) {
             charSensorInt->notify();
             charSensorExt->notify();
             charEstado->notify();
+
+            // Mientras el reloj no este configurado (ts < 2020), notificar HORA
+            // cada 5 s para que el cliente envie su timestamp en cuanto suscriba.
+            // Una vez recibido un timestamp valido, time() > umbral y se detiene.
+            uint32_t ts = (uint32_t)time(nullptr);
+            if (ts < 1577836800UL && horaSyncCount < 10) {
+                if (horaSyncTick == 0) {
+                    charHora->setValue((uint8_t*)&ts, sizeof(ts));
+                    charHora->notify();
+                    horaSyncCount++;
+                    Serial.printf("[BLE] HORA sin reloj, notificando cliente (%u/10): %u\n",
+                                  horaSyncCount, ts);
+                }
+                if (++horaSyncTick >= 5) horaSyncTick = 0;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(1000));

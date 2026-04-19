@@ -12,8 +12,10 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <Preferences.h>
+#include <esp_system.h>
 
-#define CONFIG_NVS_NAMESPACE "config"
+#define CONFIG_NVS_NAMESPACE   "config"
+#define RESETLOG_NVS_NAMESPACE "resetlog"
 
 // =============================================================================
 // UUIDs del servicio de configuracion
@@ -22,6 +24,8 @@
 #define CONFIG_SVC_UUID       "1b5ab4f0-0002-1000-8000-000000000000"
 #define CHAR_UMBRALES_UUID    "1b5ab4f0-0002-1000-8000-000000000001"
 #define CHAR_INTERVALOS_UUID  "1b5ab4f0-0002-1000-8000-000000000002"
+#define CHAR_SCHEDULE_UUID    "1b5ab4f0-0002-1000-8000-000000000003"
+#define CHAR_RESET_INFO_UUID  "1b5ab4f0-0002-1000-8000-000000000004"
 
 // =============================================================================
 // Datos compartidos con main.cpp
@@ -39,6 +43,9 @@ extern uint32_t intervalExtractorMs;
 extern uint32_t intervalDehumidMs;
 extern uint32_t intervalSafeOffMs;
 extern uint32_t intervalConfirmationMs;
+
+extern Schedule            schedule;
+extern esp_reset_reason_t  bootResetReason;
 
 // =============================================================================
 // Payloads packed
@@ -157,6 +164,58 @@ class IntervalosCallback : public BLECharacteristicCallbacks {
 };
 
 // =============================================================================
+// Callback SCHEDULE (READ + WRITE)
+// Payload: struct Schedule packed (18 B)
+// =============================================================================
+
+class ScheduleCallback : public BLECharacteristicCallbacks {
+    void onRead(BLECharacteristic* c) override {
+        Schedule buf;
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            buf = schedule;
+            xSemaphoreGive(dataMutex);
+        }
+        c->setValue((uint8_t*)&buf, sizeof(buf));
+    }
+
+    void onWrite(BLECharacteristic* c) override {
+        if (c->getLength() < sizeof(Schedule)) return;
+        Schedule buf;
+        memcpy(&buf, c->getData(), sizeof(buf));
+
+        // Validacion
+        if (buf.count > 4) {
+            Serial.println("[BLE] SCHEDULE rechazado (count > 4)");
+            return;
+        }
+        for (uint8_t i = 0; i < buf.count; i++) {
+            if (buf.periods[i].startHour > 23 || buf.periods[i].startMin > 59 ||
+                buf.periods[i].endHour   > 23 || buf.periods[i].endMin   > 59) {
+                Serial.println("[BLE] SCHEDULE rechazado (periodo invalido)");
+                return;
+            }
+        }
+
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            schedule = buf;
+            xSemaphoreGive(dataMutex);
+        }
+        Serial.printf("[BLE] SCHEDULE: enabled=%u count=%u\n", buf.enabled, buf.count);
+        for (uint8_t i = 0; i < buf.count; i++) {
+            Serial.printf("  [%u] %02u:%02u - %02u:%02u\n", i,
+                          buf.periods[i].startHour, buf.periods[i].startMin,
+                          buf.periods[i].endHour,   buf.periods[i].endMin);
+        }
+
+        Preferences p;
+        if (p.begin(CONFIG_NVS_NAMESPACE, false)) {
+            p.putBytes("sched", &schedule, sizeof(schedule));
+            p.end();
+        }
+    }
+};
+
+// =============================================================================
 // bleConfigLoad — leer valores persistidos desde NVS al arranque
 // =============================================================================
 
@@ -176,12 +235,72 @@ void bleConfigLoad() {
     intervalSafeOffMs      = p.getUInt ("iv_safe", intervalSafeOffMs);
     intervalConfirmationMs = p.getUInt ("iv_conf", intervalConfirmationMs);
 
+    uint8_t schedBuf[sizeof(Schedule)] = {};
+    if (p.getBytes("sched", schedBuf, sizeof(schedBuf)) == sizeof(Schedule)) {
+        memcpy(&schedule, schedBuf, sizeof(Schedule));
+    }
+
     p.end();
     Serial.printf("[CONFIG] Umbrales: act=%.1f des=%.1f dlt=%.1f\n",
                   humActivate, humDeactivate, humDelta);
     Serial.printf("[CONFIG] Intervalos (ms): idle=%u ext=%u deh=%u safe=%u conf=%u\n",
                   intervalIdleMs, intervalExtractorMs, intervalDehumidMs,
                   intervalSafeOffMs, intervalConfirmationMs);
+    Serial.printf("[CONFIG] Schedule: enabled=%u count=%u\n",
+                  schedule.enabled, schedule.count);
+}
+
+// =============================================================================
+// Registro de resets — variables, helper, callback y funcion de inicializacion
+// =============================================================================
+
+static uint32_t resetCount      = 0;
+static uint8_t  lastResetReason = 0;
+
+static const char* resetReasonStr(uint8_t r) {
+    switch (r) {
+        case 1:  return "POWERON";
+        case 2:  return "EXT_PIN";
+        case 3:  return "SOFTWARE";
+        case 4:  return "PANIC";
+        case 5:  return "INT_WDT";
+        case 6:  return "TASK_WDT";
+        case 7:  return "WDT";
+        case 8:  return "DEEPSLEEP";
+        case 9:  return "BROWNOUT";
+        case 10: return "SDIO";
+        default: return "UNKNOWN";
+    }
+}
+
+class ResetInfoCallback : public BLECharacteristicCallbacks {
+    void onRead(BLECharacteristic* c) override {
+        uint8_t buf[5];
+        memcpy(buf, &resetCount, 4);
+        buf[4] = lastResetReason;
+        c->setValue(buf, sizeof(buf));
+    }
+};
+
+void resetInfoInit() {
+    Preferences p;
+    if (p.begin(RESETLOG_NVS_NAMESPACE, false)) {
+        resetCount      = p.getUInt ("rst_cnt", 0);
+        lastResetReason = p.getUChar("rst_rsn", 0);
+
+        if (bootResetReason != ESP_RST_POWERON) {
+            resetCount++;
+            lastResetReason = (uint8_t)bootResetReason;
+            p.putUInt ("rst_cnt", resetCount);
+            p.putUChar("rst_rsn", lastResetReason);
+        }
+        p.end();
+    }
+
+    Serial.printf("[RESET] Arranque: %-10s  Resets acumulados: %u  Ultimo: %s\n",
+                  resetReasonStr((uint8_t)bootResetReason),
+                  resetCount,
+                  resetReasonStr(lastResetReason));
 }
 
 // =============================================================================
@@ -189,8 +308,8 @@ void bleConfigLoad() {
 // =============================================================================
 
 void bleConfigServiceInit(BLEServer* server) {
-    // 1 servicio + 2 chars × 2 handles = 5 minimo; 10 con margen
-    BLEService* svc = server->createService(BLEUUID(CONFIG_SVC_UUID), 10);
+    // 1 servicio + 4 chars × 2 handles = 9 minimo; 20 con margen
+    BLEService* svc = server->createService(BLEUUID(CONFIG_SVC_UUID), 20);
 
     BLECharacteristic* charUmbrales = svc->createCharacteristic(
         CHAR_UMBRALES_UUID,
@@ -201,6 +320,16 @@ void bleConfigServiceInit(BLEServer* server) {
         CHAR_INTERVALOS_UUID,
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
     charIntervalos->setCallbacks(new IntervalosCallback());
+
+    BLECharacteristic* charSchedule = svc->createCharacteristic(
+        CHAR_SCHEDULE_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+    charSchedule->setCallbacks(new ScheduleCallback());
+
+    BLECharacteristic* charResetInfo = svc->createCharacteristic(
+        CHAR_RESET_INFO_UUID,
+        BLECharacteristic::PROPERTY_READ);
+    charResetInfo->setCallbacks(new ResetInfoCallback());
 
     svc->start();
 
