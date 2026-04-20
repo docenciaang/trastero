@@ -282,6 +282,10 @@ class ResetInfoCallback : public BLECharacteristicCallbacks {
     }
 };
 
+uint32_t    resetInfoGetCount()            { return resetCount; }
+uint8_t     resetInfoGetReason()           { return lastResetReason; }
+const char* resetInfoReasonStr(uint8_t r)  { return resetReasonStr(r); }
+
 void resetInfoInit() {
     Preferences p;
     if (p.begin(RESETLOG_NVS_NAMESPACE, false)) {

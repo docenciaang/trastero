@@ -47,3 +47,8 @@ void resetInfoInit();
 // Inicializa el servicio de configuracion sobre el servidor ya creado.
 // Llamar desde bleInit() tras arrancar los otros servicios.
 void bleConfigServiceInit(BLEServer* server);
+
+// Acceso de solo lectura a los datos de reset (para la pantalla OLED).
+uint32_t    resetInfoGetCount();
+uint8_t     resetInfoGetReason();
+const char* resetInfoReasonStr(uint8_t reason);

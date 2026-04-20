@@ -86,6 +86,10 @@ void eventLogEnqueue(const LogEntry& e);
 // Devuelve el número de registros almacenados (lectura directa, sin mutex).
 uint32_t eventLogGetCount();
 
+// Busca el ultimo registro con newState == EXTRACTOR_ON y lo copia en out.
+// Devuelve true si lo encontro. Toma logMutex internamente (timeout 200 ms).
+bool eventLogGetLastExtractor(LogRecord& out);
+
 // Inicia la transferencia CSV por BLE (escribe 0x01 en LOG_CTRL).
 void eventLogStartStream();
 

@@ -127,7 +127,8 @@ TaskHandle_t hTaskDisplay = nullptr;
 // Marca de tiempo hasta la que la pantalla debe permanecer encendida.
 // Escrita desde ISR y leida desde taskDisplay; volatile es suficiente
 // porque en ESP32 los accesos a uint32 alineados son atomicos.
-volatile unsigned long displayOffAt = 0;
+volatile unsigned long displayOffAt     = 0;
+volatile uint32_t      buttonPressCount = 0;  // incrementado en la ISR por cada pulsacion
 
 // =============================================================================
 // Objetos hardware (cada uno solo se usa desde una tarea, sin mutex propio)
@@ -141,6 +142,7 @@ DHT dhtExterior(PIN_DHT_EXTERIOR, DHT21);           // solo taskSensors
 // ISR boton — rearma el temporizador de pantalla
 // =============================================================================
 void IRAM_ATTR isrButton() {
+    buttonPressCount++;
     displayOffAt = millis() + DISPLAY_TIMEOUT_MS;
 }
 
@@ -389,7 +391,7 @@ void taskSensors(void*) {
             xSemaphoreGive(dataMutex);
         }
 
-        if (okInt) Serial.printf("[INT] T=%.1f C  H=%.1f%%\n", ti, hi);
+        if (okInt) Serial.printf("[INT] T=%.1f C  H=%.1f%% | ", ti, hi);
         if (okExt) Serial.printf("[EXT] T=%.1f C  H=%.1f%%\n", te, he);
 
         // Duerme el intervalo adaptativo segun el estado actual.
@@ -460,19 +462,99 @@ void taskControl(void*) {
 }
 
 // =============================================================================
+// Pantalla 1 — ultima activacion del extractor
+// =============================================================================
+
+static void renderLastExtractor(const LogRecord& rec, bool valid) {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(0, 0, "Ult. Extractor");
+    display.drawHorizontalLine(0, 12, 128);
+
+    if (!valid) {
+        display.setTextAlignment(TEXT_ALIGN_CENTER);
+        display.drawString(64, 28, "Sin activaciones");
+    } else {
+        if (rec.timestamp > 1577836800UL) {
+            struct tm t;
+            time_t ts = (time_t)rec.timestamp;
+            gmtime_r(&ts, &t);
+            char dtBuf[20];
+            snprintf(dtBuf, sizeof(dtBuf), "%04d-%02d-%02d %02d:%02d",
+                     t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                     t.tm_hour, t.tm_min);
+            display.drawString(0, 14, dtBuf);
+        } else {
+            display.drawString(0, 14, "Sin fecha");
+        }
+        char buf[22];
+        if (rec.intValid) snprintf(buf, sizeof(buf), "INT %.1fC  %.1f%%", rec.intTemp, rec.intHum);
+        else              strcpy(buf, "INT --");
+        display.drawString(0, 28, buf);
+
+        if (rec.extValid) snprintf(buf, sizeof(buf), "EXT %.1fC  %.1f%%", rec.extTemp, rec.extHum);
+        else              strcpy(buf, "EXT --");
+        display.drawString(0, 42, buf);
+    }
+    display.display();
+}
+
+// =============================================================================
+// Pantalla 2 — informacion de resets del sistema
+// =============================================================================
+
+static void renderResetInfo() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(0, 0, "Estado Sistema");
+    display.drawHorizontalLine(0, 12, 128);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Resets: %lu", (unsigned long)resetInfoGetCount());
+    display.drawString(0, 16, buf);
+    snprintf(buf, sizeof(buf), "Ultimo: %s", resetInfoReasonStr(resetInfoGetReason()));
+    display.drawString(0, 32, buf);
+    display.display();
+}
+
+// =============================================================================
 // taskDisplay (Core 0, prio 1)
 // Copia los datos compartidos bajo el mutex y renderiza fuera de el
 // para no bloquear las tareas criticas durante el I2C del display.
 // =============================================================================
 void taskDisplay(void*) {
-    bool screenOn = true;
+    bool      screenOn        = true;
+    uint8_t   displayScreen   = 0;      // 0=principal  1=ult.extractor  2=resets
+    uint32_t  lastBtnCount    = 0;
+    LogRecord lastExtRec      = {};
+    bool      lastExtValid    = false;
 
     for (;;) {
         bool shouldBeOn = (millis() < displayOffAt);
 
+        // --- Deteccion de pulsaciones del boton ---
+        uint32_t curBtnCount = buttonPressCount;
+        if (curBtnCount != lastBtnCount) {
+            uint32_t presses = curBtnCount - lastBtnCount;
+            lastBtnCount = curBtnCount;
+            if (screenOn) {
+                displayScreen = (displayScreen + presses) % 3;
+                if (displayScreen == 1) {
+                    // Refrescar datos al navegar a pantalla de extractor
+                    lastExtValid = eventLogGetLastExtractor(lastExtRec);
+                }
+            } else {
+                displayScreen = 0;   // pantalla apagada: encender siempre en principal
+            }
+        }
+
+        // --- Gestion de encendido / apagado ---
         if (shouldBeOn != screenOn) {
             screenOn = shouldBeOn;
             if (!screenOn) {
+                displayScreen = 0;   // al apagarse siempre volver a principal
                 display.clear();
                 display.display();
                 display.displayOff();
@@ -481,18 +563,28 @@ void taskDisplay(void*) {
             }
         }
 
+        // --- Renderizado ---
         if (screenOn) {
-            SensorData   intSnap, extSnap;
-            ControlState stateSnap;
-
-            if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-                intSnap   = interior;
-                extSnap   = exterior;
-                stateSnap = currentState;
-                xSemaphoreGive(dataMutex);
+            switch (displayScreen) {
+                case 0: {
+                    SensorData   intSnap, extSnap;
+                    ControlState stateSnap;
+                    if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+                        intSnap   = interior;
+                        extSnap   = exterior;
+                        stateSnap = currentState;
+                        xSemaphoreGive(dataMutex);
+                    }
+                    renderDisplay(intSnap, extSnap, stateSnap, bleIsConnected());
+                    break;
+                }
+                case 1:
+                    renderLastExtractor(lastExtRec, lastExtValid);
+                    break;
+                case 2:
+                    renderResetInfo();
+                    break;
             }
-
-            renderDisplay(intSnap, extSnap, stateSnap, bleIsConnected());
         }
 
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_INTERVAL_MS));

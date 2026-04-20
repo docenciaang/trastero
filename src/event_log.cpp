@@ -171,6 +171,23 @@ uint32_t eventLogGetCount() {
     return hdr.count;
 }
 
+bool eventLogGetLastExtractor(LogRecord& out) {
+    if (hdr.count == 0) return false;
+    bool found = false;
+    if (xSemaphoreTake(logMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        for (int32_t i = (int32_t)hdr.count - 1; i >= 0; i--) {
+            LogRecord rec;
+            if (readRecord((uint32_t)i, rec) && rec.newState == 1u) {  // 1 = EXTRACTOR_ON
+                out   = rec;
+                found = true;
+                break;
+            }
+        }
+        xSemaphoreGive(logMutex);
+    }
+    return found;
+}
+
 void eventLogStartStream() {
     streamIndex      = 0;
     streamHeaderSent = false;
